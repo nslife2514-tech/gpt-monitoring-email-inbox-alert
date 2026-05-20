@@ -75,6 +75,25 @@ IGNORE_SENDERS = [
 ]
 
 
+def html_escape(text):
+    if text is None:
+        return ""
+
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def truncate_text(text, max_length=3500):
+    if len(text) <= max_length:
+        return text
+
+    return text[:max_length] + "\n\n...[message truncated]"
+
+
 def decode_text(value):
     if not value:
         return ""
@@ -112,11 +131,14 @@ def load_sent_ids():
 
 
 def save_sent_ids(sent_ids):
+    # เก็บเฉพาะ 500 รายการล่าสุด เพื่อไม่ให้ไฟล์ใหญ่เกินไป
     save_json_file(STATE_FILE, list(sent_ids)[-500:])
 
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    message = truncate_text(message, 3500)
 
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -126,7 +148,10 @@ def send_telegram(message):
     }
 
     response = requests.post(url, json=payload, timeout=20)
-    response.raise_for_status()
+
+    if response.status_code != 200:
+        print("Telegram error:", response.status_code, response.text)
+        response.raise_for_status()
 
 
 def extract_body(msg):
@@ -243,27 +268,41 @@ def classify(score):
 
 
 def build_alert(sender, subject, date_text, level, score, reasons, attachments, pending):
-    reason_text = "\n".join([f"- {r}" for r in reasons[:8]]) or "- ไม่พบเหตุผลเฉพาะ"
+    safe_sender = html_escape(sender)
+    safe_subject = html_escape(subject)
+    safe_date = html_escape(date_text)
+    safe_level = html_escape(level)
+    safe_score = html_escape(score)
+
+    reason_text = "\n".join(
+        [f"- {html_escape(r)}" for r in reasons[:8]]
+    ) or "- ไม่พบเหตุผลเฉพาะ"
 
     if attachments:
         attachment_text = "\n".join(
-            [f"- {a['filename']} ({a['content_type']})" for a in attachments[:5]]
+            [
+                f"- {html_escape(a['filename'])} ({html_escape(a['content_type'])})"
+                for a in attachments[:5]
+            ]
         )
     else:
         attachment_text = "ไม่มีไฟล์แนบ"
 
     pending_text = ""
     if pending:
-        pending_text = "\n\n⚠ <b>Pending Verification</b>\nพบ PDF / ไฟล์แนบ / URL ที่ควรตรวจสอบก่อนใช้งานจริง"
+        pending_text = (
+            "\n\n⚠ <b>Pending Verification</b>\n"
+            "พบ PDF / ไฟล์แนบ / URL ที่ควรตรวจสอบก่อนใช้งานจริง"
+        )
 
     return f"""📧 <b>Important Email Alert</b>
 
-<b>Level:</b> {level}
-<b>Score:</b> {score}
+<b>Level:</b> {safe_level}
+<b>Score:</b> {safe_score}
 
-<b>From:</b> {sender}
-<b>Subject:</b> {subject}
-<b>Date:</b> {date_text}
+<b>From:</b> {safe_sender}
+<b>Subject:</b> {safe_subject}
+<b>Date:</b> {safe_date}
 
 <b>Reason:</b>
 {reason_text}
