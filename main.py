@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import imaplib
 import email
 import requests
@@ -15,6 +16,10 @@ STATE_FILE = "sent_email_ids.json"
 HEARTBEAT_FILE = "heartbeat_state.json"
 
 
+# =========================
+# STRICT BUSINESS KEYWORDS
+# =========================
+
 HIGH_KEYWORDS = [
     "ใบเสนอราคา",
     "quotation",
@@ -25,9 +30,7 @@ HIGH_KEYWORDS = [
     "contract",
     "agreement",
     "proposal",
-    "project",
     "purchase order",
-    "po",
     "approve",
     "approval",
     "urgent",
@@ -37,7 +40,6 @@ MEDIUM_KEYWORDS = [
     "sprinkler",
     "fire pump",
     "fire protection",
-    "nfpa",
     "catalog",
     "drawing",
     "technical",
@@ -49,7 +51,8 @@ MEDIUM_KEYWORDS = [
     "consultant",
 ]
 
-IGNORE_KEYWORDS = [
+# คำพวกนี้ถ้าเจอ จะลดคะแนนแรง
+PROMOTION_KEYWORDS = [
     "promotion",
     "discount",
     "sale",
@@ -62,16 +65,48 @@ IGNORE_KEYWORDS = [
     "limited offer",
     "gift",
     "credit",
+    "shop",
+    "class",
+    "academy",
+    "learn",
+    "training",
+    "invite",
+    "invited",
+    "business guide",
+    "download",
+    "save up to",
+    "ส่วนลด",
+    "หมดอายุ",
+    "คลาสเรียน",
+    "เพิ่มยอดขาย",
+    "แคมเปญ",
 ]
 
-IGNORE_SENDERS = [
+# sender ที่ไม่ควรแจ้งเตือน ยกเว้นในอนาคตเราตั้ง whitelist เฉพาะ
+HARD_IGNORE_SENDERS = [
     "temu",
     "coursera",
     "alison",
     "instagram",
+    "tiktok",
+    "shop.tiktok.com",
     "microsoftstore",
+    "aia.co.th",
+    "nfpa.org",
+    "noreply@tm.openai.com",
+    "notifications@github.com",
     "newsletter",
     "marketing",
+]
+
+# sender ที่เป็นระบบอัตโนมัติทั่วไป
+AUTO_SENDERS = [
+    "no-reply",
+    "noreply",
+    "donotreply",
+    "do-not-reply",
+    "notification",
+    "notifications",
 ]
 
 
@@ -131,8 +166,7 @@ def load_sent_ids():
 
 
 def save_sent_ids(sent_ids):
-    # เก็บเฉพาะ 500 รายการล่าสุด เพื่อไม่ให้ไฟล์ใหญ่เกินไป
-    save_json_file(STATE_FILE, list(sent_ids)[-500:])
+    save_json_file(STATE_FILE, list(sent_ids)[-1000:])
 
 
 def send_telegram(message):
@@ -219,6 +253,49 @@ def has_pdf_or_url(subject, body, attachments):
     return False
 
 
+def contains_keyword(text, keyword):
+    text = text.lower()
+    keyword = keyword.lower()
+
+    # ภาษาไทยและ phrase ยาว ใช้ contains ได้
+    if any(ord(ch) > 127 for ch in keyword) or " " in keyword:
+        return keyword in text
+
+    # keyword อังกฤษสั้น/คำเดี่ยว ต้อง match เป็นคำจริงเท่านั้น
+    pattern = r"\b" + re.escape(keyword) + r"\b"
+    return re.search(pattern, text) is not None
+
+
+def count_matches(text, keywords):
+    matches = []
+
+    for keyword in keywords:
+        if contains_keyword(text, keyword):
+            matches.append(keyword)
+
+    return matches
+
+
+def is_hard_ignore_sender(sender):
+    sender_lower = sender.lower()
+
+    for item in HARD_IGNORE_SENDERS:
+        if item.lower() in sender_lower:
+            return True
+
+    return False
+
+
+def is_auto_sender(sender):
+    sender_lower = sender.lower()
+
+    for item in AUTO_SENDERS:
+        if item.lower() in sender_lower:
+            return True
+
+    return False
+
+
 def score_email(sender, subject, body, attachments):
     text = f"{sender} {subject} {body}".lower()
     sender_lower = sender.lower()
@@ -226,42 +303,64 @@ def score_email(sender, subject, body, attachments):
     score = 0
     reasons = []
 
-    for word in HIGH_KEYWORDS:
-        if word.lower() in text:
-            score += 5
-            reasons.append(f"พบ keyword สำคัญ: {word}")
+    high_matches = count_matches(text, HIGH_KEYWORDS)
+    medium_matches = count_matches(text, MEDIUM_KEYWORDS)
+    promotion_matches = count_matches(text, PROMOTION_KEYWORDS)
 
-    for word in MEDIUM_KEYWORDS:
-        if word.lower() in text:
-            score += 3
-            reasons.append(f"พบ keyword งาน/เทคนิค: {word}")
+    for word in high_matches:
+        score += 6
+        reasons.append(f"พบ keyword สำคัญจริง: {word}")
 
-    for word in IGNORE_KEYWORDS:
-        if word.lower() in text:
-            score -= 4
-            reasons.append(f"มีลักษณะ promotion/newsletter: {word}")
+    for word in medium_matches:
+        score += 3
+        reasons.append(f"พบ keyword งาน/เทคนิค: {word}")
 
-    for sender_word in IGNORE_SENDERS:
-        if sender_word in sender_lower:
-            score -= 5
-            reasons.append(f"sender อยู่ในกลุ่มที่มักไม่สำคัญ: {sender_word}")
+    for word in promotion_matches:
+        score -= 6
+        reasons.append(f"มีลักษณะ promotion/newsletter: {word}")
 
     if attachments:
-        score += 3
+        score += 4
         reasons.append(f"มีไฟล์แนบ {len(attachments)} ไฟล์")
 
-    if "no-reply" not in sender_lower and "noreply" not in sender_lower:
+    if is_auto_sender(sender):
+        score -= 4
+        reasons.append("sender เป็นระบบอัตโนมัติ / no-reply")
+
+    if not is_auto_sender(sender):
         score += 2
         reasons.append("sender ดูเป็นบุคคล/บริษัทจริง")
 
-    return score, reasons
+    # sender hard ignore ลดแรง
+    if is_hard_ignore_sender(sender):
+        score -= 10
+        reasons.append("sender อยู่ใน hard ignore list")
+
+    return score, reasons, high_matches, medium_matches, promotion_matches
 
 
-def classify(score):
-    if score >= 8:
+def classify(sender, score, high_matches, medium_matches, promotion_matches, attachments):
+    # ตัด sender ที่เป็น hard ignore ออกก่อน ยกเว้นมี keyword สำคัญจริงมาก
+    if is_hard_ignore_sender(sender) and len(high_matches) == 0:
+        return "IGNORE"
+
+    # ถ้าเป็น promotion และไม่มี keyword สำคัญจริง ไม่ส่ง
+    if len(promotion_matches) > 0 and len(high_matches) == 0:
+        return "IGNORE"
+
+    # ต้องมี high keyword อย่างน้อย 1 ตัว หรือ มี attachment + medium keyword
+    has_real_business_signal = (
+        len(high_matches) > 0 or
+        (attachments and len(medium_matches) > 0)
+    )
+
+    if not has_real_business_signal:
+        return "IGNORE"
+
+    if score >= 10:
         return "HIGH"
 
-    if score >= 5:
+    if score >= 7:
         return "MEDIUM"
 
     return "IGNORE"
@@ -366,7 +465,8 @@ def main():
     mail.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
     mail.select("inbox", readonly=True)
 
-    since_date = (datetime.now() - timedelta(days=2)).strftime("%d-%b-%Y")
+    # เช็คย้อนหลัง 1 วันพอ เพราะ workflow รันทุก 15 นาที
+    since_date = (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y")
     status, data = mail.search(None, f'(SINCE "{since_date}")')
 
     if status != "OK":
@@ -399,8 +499,22 @@ def main():
 
         total_checked += 1
 
-        score, reasons = score_email(sender, subject, body, attachments)
-        level = classify(score)
+        score, reasons, high_matches, medium_matches, promotion_matches = score_email(
+            sender,
+            subject,
+            body,
+            attachments
+        )
+
+        level = classify(
+            sender=sender,
+            score=score,
+            high_matches=high_matches,
+            medium_matches=medium_matches,
+            promotion_matches=promotion_matches,
+            attachments=attachments
+        )
+
         pending = has_pdf_or_url(subject, body, attachments)
 
         if level != "IGNORE":
